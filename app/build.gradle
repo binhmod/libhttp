@@ -1,0 +1,40 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace 'binhmod.libhttp'
+    compileSdk 36
+    ndkVersion '29.0.14033849'
+
+    defaultConfig {
+        applicationId 'binhmod.libhttp'
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        ndk {
+            abiFilters "arm64-v8a", "armeabi-v7a" // can remove this
+        }
+    }
+
+    buildFeatures {
+        prefab true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '4.1.2'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "io.github.vvb2060.ndk:boringssl:20250114"
+}

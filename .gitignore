@@ -1,0 +1,48 @@
+# Gradle
+.gradle/
+**/build/
+!**/build/
+build/
+
+# Local config
+local.properties
+
+# IDE
+.idea/
+!.idea/codeStyles
+!.idea/runConfigurations
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Keystore
+*.jks
+*.keystore
+
+# APK/AAB
+*.apk
+*.aab
+
+# Kotlin
+.kotlin/
+
+# Android Studio
+/captures
+.externalNativeBuild
+.cxx
+
+# Generated files
+/bin
+/out
+/gen
+
+# ACS Editor
+.acside
+
+# AndroidIDE
+/.androidide

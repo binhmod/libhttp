@@ -333,7 +333,7 @@ static bool httpRequest(HttpRequest& req, HttpResponse& resp) {
             if (!req.cacert.empty()) {
                 ret = mbedtls_x509_crt_parse_file(&tls.cacert, req.cacert.c_str());
                 if (ret != 0) {
-                    fprintf(stderr, "http: cannot load -cacert %s: -0x%04x\n",
+                    fprintf(stderr, "http: cannot load --cacert %s: -0x%04x\n",
                             req.cacert.c_str(), -ret);
                     close(fd); return false;
                 }
@@ -343,11 +343,11 @@ static bool httpRequest(HttpRequest& req, HttpResponse& resp) {
                 mbedtls_ssl_conf_authmode(&tls.conf, MBEDTLS_SSL_VERIFY_NONE);
             }
 #else
-            // Desktop: -cacert takes priority, then probe system bundle paths.
+            // Desktop: --cacert takes priority, then probe system bundle paths.
             if (!req.cacert.empty()) {
                 ret = mbedtls_x509_crt_parse_file(&tls.cacert, req.cacert.c_str());
                 if (ret != 0) {
-                    fprintf(stderr, "http: cannot load -cacert %s: -0x%04x\n",
+                    fprintf(stderr, "http: cannot load --cacert %s: -0x%04x\n",
                             req.cacert.c_str(), -ret);
                     close(fd); return false;
                 }
@@ -366,7 +366,7 @@ static bool httpRequest(HttpRequest& req, HttpResponse& resp) {
                     }
                 }
                 if (!loaded) {
-                    fprintf(stderr, "http: no CA bundle found - use -cacert <file> or -k\n");
+                    fprintf(stderr, "http: no CA bundle found - use --cacert <file> or -k\n");
                     close(fd); return false;
                 }
             }

@@ -2,12 +2,17 @@ cmake_minimum_required(VERSION 3.18)
 project(libhttp)
 
 find_library(log-lib log)
-find_package(boringssl REQUIRED CONFIG)
+set(ENABLE_TESTING  OFF CACHE BOOL "" FORCE)
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 
+add_subdirectory(third_party/mbedtls)
+
+# ================= Target =================
 add_executable(http http.cpp)
 
 target_compile_options(http PRIVATE
-    -Oz -flto                   
+    -Oz -flto
     -ffunction-sections -fdata-sections
     -fomit-frame-pointer
     -fvisibility=hidden -fvisibility-inlines-hidden
@@ -25,22 +30,27 @@ target_link_options(http PRIVATE
     -Wl,--icf=all
     -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     -Wl,--hash-style=sysv -Wl,--build-id=none
-    -Wl,--pack-dyn-relocs=android   # thêm dòng này
+    -Wl,--pack-dyn-relocs=android
 )
 
 # ================= DEFINITIONS =================
 set(COMMON_DEFS
-    NDEBUG BORINGSSL_NO_ASM OPENSSL_NO_SSL OPENSSL_NO_TLS
-    OPENSSL_NO_OCSP OPENSSL_NO_ENGINE OPENSSL_NO_SRP OPENSSL_NO_COMP
+    NDEBUG
     PRIVATE_IMPLEMENTATION HIDDEN_VISIBILITY
+    MBEDTLS_CONFIG_FILE="mbedtls_config.h"
 )
 
 target_compile_definitions(http PRIVATE ${COMMON_DEFS})
 
+target_include_directories(http PRIVATE
+    third_party/mbedtls/include
+)
+
 target_link_libraries(http
     z
-    boringssl::ssl_static
-    boringssl::crypto_static
+    mbedtls
+    mbedx509
+    mbedcrypto
     ${log-lib}
 )
 

@@ -18,10 +18,6 @@ android {
         }
     }
 
-    buildFeatures {
-        prefab true
-    }
-
     externalNativeBuild {
         cmake {
             path 'src/main/cpp/CMakeLists.txt'
@@ -33,8 +29,4 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-}
-
-dependencies {
-    implementation "io.github.vvb2060.ndk:boringssl:20250114"
 }

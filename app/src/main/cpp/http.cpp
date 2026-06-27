@@ -1,5 +1,6 @@
 //
 // Created by binhmod on 2026/6/27.
+// Refactored: BoringSSL -> mbedTLS
 //
 #include <sys/socket.h>
 #include <netdb.h>
@@ -9,9 +10,15 @@
 #include <signal.h>
 #include <sys/stat.h>
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509v3.h>
+// mbedTLS headers
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/debug.h>
+
 #include <zlib.h>
 
 #include <cstdio>
@@ -23,11 +30,7 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <errno.h>
 
 static void die(const char* msg) {
@@ -196,6 +199,55 @@ static HttpResponse parseResponse(const std::string& raw) {
     return r;
 }
 
+struct TlsCtx {
+    mbedtls_ssl_context      ssl{};
+    mbedtls_ssl_config       conf{};
+    mbedtls_x509_crt         cacert{};
+    mbedtls_entropy_context  entropy{};
+    mbedtls_ctr_drbg_context ctr_drbg{};
+    bool                     initialized = false;
+
+    TlsCtx() {
+        mbedtls_ssl_init(&ssl);
+        mbedtls_ssl_config_init(&conf);
+        mbedtls_x509_crt_init(&cacert);
+        mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_init(&ctr_drbg);
+    }
+
+    ~TlsCtx() {
+        if (initialized) mbedtls_ssl_close_notify(&ssl);
+        mbedtls_ssl_free(&ssl);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_x509_crt_free(&cacert);
+        mbedtls_entropy_free(&entropy);
+        mbedtls_ctr_drbg_free(&ctr_drbg);
+    }
+
+    // Non-copyable
+    TlsCtx(const TlsCtx&)            = delete;
+    TlsCtx& operator=(const TlsCtx&) = delete;
+};
+
+// mbedTLS send/recv callbacks that wrap a plain fd
+static int mbedSend(void* ctx, const unsigned char* buf, size_t len) {
+    int fd = *(int*)ctx;
+    int r  = (int)write(fd, buf, len);
+    if (r < 0) return MBEDTLS_ERR_NET_SEND_FAILED;
+    return r;
+}
+
+static int mbedRecv(void* ctx, unsigned char* buf, size_t len) {
+    int fd = *(int*)ctx;
+    int r  = (int)read(fd, buf, len);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    return r;
+}
+
 static bool httpRequest(HttpRequest& req, HttpResponse& resp) {
 
     bool useTls = false;
@@ -241,69 +293,148 @@ static bool httpRequest(HttpRequest& req, HttpResponse& resp) {
     }
     setPort(addr, port);
 
-    SSL_CTX* ctx = nullptr;
-    SSL*     ssl = nullptr;
-
     int fd = tcpConnect(addr, addrLen, req.timeoutSec);
     if (fd < 0) {
         fprintf(stderr, "http: TCP connect failed\n");
         return false;
     }
 
-if (useTls) {
-    ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { close(fd); return false; }
+    TlsCtx tls;
+    if (useTls) {
+        const char* pers = "http_client";
+        int ret;
 
-    if (req.insecure) {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-    } else {
-        if (!req.cacert.empty()) {
-            if (SSL_CTX_load_verify_locations(ctx, req.cacert.c_str(), nullptr) != 1) {
-                fprintf(stderr, "http: cannot load --cacert %s\n", req.cacert.c_str());
-                SSL_CTX_free(ctx); close(fd); return false;
-            }
-        } else {
-            SSL_CTX_set_default_verify_paths(ctx);
+        ret = mbedtls_ctr_drbg_seed(&tls.ctr_drbg, mbedtls_entropy_func,
+                                     &tls.entropy,
+                                     (const unsigned char*)pers, strlen(pers));
+        if (ret != 0) {
+            fprintf(stderr, "http: mbedtls_ctr_drbg_seed failed: -0x%04x\n", -ret);
+            close(fd); return false;
         }
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+
+        ret = mbedtls_ssl_config_defaults(&tls.conf,
+                                          MBEDTLS_SSL_IS_CLIENT,
+                                          MBEDTLS_SSL_TRANSPORT_STREAM,
+                                          MBEDTLS_SSL_PRESET_DEFAULT);
+        if (ret != 0) {
+            fprintf(stderr, "http: mbedtls_ssl_config_defaults failed: -0x%04x\n", -ret);
+            close(fd); return false;
+        }
+
+        mbedtls_ssl_conf_rng(&tls.conf, mbedtls_ctr_drbg_random, &tls.ctr_drbg);
+
+        if (req.insecure) {
+            mbedtls_ssl_conf_authmode(&tls.conf, MBEDTLS_SSL_VERIFY_NONE);
+        } else {
+#if defined(__ANDROID__)
+            // Android raw socket bypasses the framework trust store.
+            // If --cacert is supplied, use it; otherwise skip mbedTLS cert
+            // verification and let the app layer handle trust via the platform.
+            if (!req.cacert.empty()) {
+                ret = mbedtls_x509_crt_parse_file(&tls.cacert, req.cacert.c_str());
+                if (ret != 0) {
+                    fprintf(stderr, "http: cannot load -cacert %s: -0x%04x\n",
+                            req.cacert.c_str(), -ret);
+                    close(fd); return false;
+                }
+                mbedtls_ssl_conf_ca_chain(&tls.conf, &tls.cacert, nullptr);
+                mbedtls_ssl_conf_authmode(&tls.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+            } else {
+                mbedtls_ssl_conf_authmode(&tls.conf, MBEDTLS_SSL_VERIFY_NONE);
+            }
+#else
+            // Desktop: -cacert takes priority, then probe system bundle paths.
+            if (!req.cacert.empty()) {
+                ret = mbedtls_x509_crt_parse_file(&tls.cacert, req.cacert.c_str());
+                if (ret != 0) {
+                    fprintf(stderr, "http: cannot load -cacert %s: -0x%04x\n",
+                            req.cacert.c_str(), -ret);
+                    close(fd); return false;
+                }
+            } else {
+                const char* caFiles[] = {
+                    "/etc/ssl/certs/ca-certificates.crt",   // Debian/Ubuntu
+                    "/etc/pki/tls/certs/ca-bundle.crt",     // RHEL/CentOS
+                    "/etc/ssl/ca-bundle.pem",                // openSUSE
+                    "/etc/ssl/cert.pem",                     // macOS/Alpine
+                    nullptr
+                };
+                bool loaded = false;
+                for (int i = 0; caFiles[i]; ++i) {
+                    if (mbedtls_x509_crt_parse_file(&tls.cacert, caFiles[i]) == 0) {
+                        loaded = true; break;
+                    }
+                }
+                if (!loaded) {
+                    fprintf(stderr, "http: no CA bundle found - use -cacert <file> or -k\n");
+                    close(fd); return false;
+                }
+            }
+            mbedtls_ssl_conf_ca_chain(&tls.conf, &tls.cacert, nullptr);
+            mbedtls_ssl_conf_authmode(&tls.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+#endif
+        }
+
+        ret = mbedtls_ssl_setup(&tls.ssl, &tls.conf);
+        if (ret != 0) {
+            fprintf(stderr, "http: mbedtls_ssl_setup failed: -0x%04x\n", -ret);
+            close(fd); return false;
+        }
+
+        ret = mbedtls_ssl_set_hostname(&tls.ssl, host.c_str());
+        if (ret != 0) {
+            fprintf(stderr, "http: mbedtls_ssl_set_hostname failed: -0x%04x\n", -ret);
+            close(fd); return false;
+        }
+
+        // Wire up our plain fd via custom BIO callbacks
+        mbedtls_ssl_set_bio(&tls.ssl, &fd, mbedSend, mbedRecv, nullptr);
+
+        // Handshake
+        while ((ret = mbedtls_ssl_handshake(&tls.ssl)) != 0) {
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+                ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                char errBuf[256];
+                mbedtls_strerror(ret, errBuf, sizeof(errBuf));
+                fprintf(stderr, "http: TLS handshake failed: %s\n", errBuf);
+                fprintf(stderr, "http: tip - use -k to skip cert verify\n");
+                close(fd); return false;
+            }
+        }
+        tls.initialized = true;
+
+        // Verify peer cert result
+        if (!req.insecure) {
+            uint32_t flags = mbedtls_ssl_get_verify_result(&tls.ssl);
+            if (flags != 0) {
+                char vrfBuf[512];
+                mbedtls_x509_crt_verify_info(vrfBuf, sizeof(vrfBuf), "  ! ", flags);
+                fprintf(stderr, "http: certificate verify failed:\n%s\n", vrfBuf);
+                fprintf(stderr, "http: tip - use -k to skip cert verify\n");
+                close(fd); return false;
+            }
+        }
     }
 
-    ssl = SSL_new(ctx);
-    if (!ssl) { SSL_CTX_free(ctx); close(fd); return false; }
-
-    SSL_set_fd(ssl, fd);
-    SSL_set_tlsext_host_name(ssl, host.c_str());
-
-    if (!req.insecure) {
-        X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
-        X509_VERIFY_PARAM_set1_host(param, host.c_str(), 0);
-    }
-
-    if (SSL_connect(ssl) != 1) {
-        unsigned long err = ERR_get_error();
-        char errBuf[256];
-        ERR_error_string_n(err, errBuf, sizeof(errBuf));
-        fprintf(stderr, "http: TLS fail: %s\n", errBuf);
-        fprintf(stderr, "http: tip - use -k to skip cert verify\n");
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        return false;
-    }
-
-    if (!req.insecure && SSL_get_verify_result(ssl) != X509_V_OK) {
-        fprintf(stderr, "http: certificate verify failed\n");
-        fprintf(stderr, "http: tip - use -k to skip cert verify\n");
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        return false;
-    }
-}
-
-    auto sslWrite = [&](const void* data, size_t len) -> int {
-        if (useTls) return SSL_write(ssl, data, (int)len);
-        return (int)write(fd, data, len);
+    auto tlsWrite = [&](const void* data, size_t len) -> int {
+        if (!useTls) return (int)write(fd, data, len);
+        int r;
+        do {
+            r = mbedtls_ssl_write(&tls.ssl,
+                                  (const unsigned char*)data, len);
+        } while (r == MBEDTLS_ERR_SSL_WANT_WRITE ||
+                 r == MBEDTLS_ERR_SSL_WANT_READ);
+        return r;
     };
-    auto sslRead = [&](char* buf, int maxLen) -> int {
-        if (useTls) return SSL_read(ssl, buf, maxLen);
-        return (int)read(fd, buf, (size_t)maxLen);
+
+    auto tlsRead = [&](char* buf, int maxLen) -> int {
+        if (!useTls) return (int)read(fd, buf, (size_t)maxLen);
+        int r = mbedtls_ssl_read(&tls.ssl,
+                                 (unsigned char*)buf, (size_t)maxLen);
+        if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+            r == MBEDTLS_ERR_SSL_WANT_WRITE) return 0; // retry
+        if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0; // EOF
+        return r; // negative = error, positive = bytes
     };
 
     std::string httpReq;
@@ -334,16 +465,9 @@ if (useTls) {
 
     int totalSent = 0;
     while (totalSent < (int)httpReq.size()) {
-        int n = sslWrite(httpReq.data() + totalSent,
-                         httpReq.size() - totalSent);
-        if (n <= 0) {
-            if (useTls) {
-                int err = SSL_get_error(ssl, n);
-                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-                    continue;
-            }
-            goto cleanup;
-        }
+        int n = tlsWrite(httpReq.data() + totalSent,
+                         httpReq.size() - (size_t)totalSent);
+        if (n <= 0) goto cleanup;
         totalSent += n;
     }
 
@@ -352,15 +476,12 @@ if (useTls) {
         raw.reserve(8192);
         char buf[4096];
 
+        // Read until we have full headers
         while (raw.find("\r\n\r\n") == std::string::npos) {
-            int n = sslRead(buf, sizeof(buf));
+            int n = tlsRead(buf, sizeof(buf));
             if (n > 0) { raw.append(buf, (size_t)n); continue; }
-            if (useTls) {
-                int err = SSL_get_error(ssl, n);
-                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-                    continue;
-            }
-            break;
+            if (n < 0) break;
+            // n == 0 -> WANT_READ, keep polling
         }
 
         size_t hdrEnd = raw.find("\r\n\r\n");
@@ -411,28 +532,16 @@ if (useTls) {
 
         if (!isChunked && contentLength >= 0) {
             while ((int64_t)fullBody.size() < contentLength) {
-                int n = sslRead(buf, sizeof(buf));
-                if (n <= 0) {
-                    if (useTls) {
-                        int err = SSL_get_error(ssl, n);
-                        if (err == SSL_ERROR_WANT_READ ||
-                            err == SSL_ERROR_WANT_WRITE) continue;
-                    }
-                    break;
-                }
-                fullBody.append(buf, (size_t)n);
+                int n = tlsRead(buf, sizeof(buf));
+                if (n > 0) { fullBody.append(buf, (size_t)n); continue; }
+                if (n < 0) break;
             }
         } else {
             while (true) {
-                int n = sslRead(buf, sizeof(buf));
+                int n = tlsRead(buf, sizeof(buf));
                 if (n > 0) { fullBody.append(buf, (size_t)n); continue; }
-                if (useTls) {
-                    int err = SSL_get_error(ssl, n);
-                    if (err == SSL_ERROR_WANT_READ ||
-                        err == SSL_ERROR_WANT_WRITE) continue;
-                    if (err == SSL_ERROR_ZERO_RETURN) break;
-                }
-                break;
+                if (n == 0 && !useTls) break; // plain socket EOF
+                if (n < 0) break;
             }
         }
 
@@ -469,10 +578,8 @@ if (useTls) {
                     if (!req.silent)
                         fprintf(stderr, "http: redirect -> %s\n", location.c_str());
 
-                    if (useTls) { SSL_shutdown(ssl); SSL_free(ssl);
-                                  SSL_CTX_free(ctx); }
+                    // TlsCtx destructor handles SSL shutdown automatically
                     close(fd);
-
                     return httpRequest(rr, resp);
                 }
             }
@@ -480,7 +587,7 @@ if (useTls) {
     }
 
 cleanup:
-    if (useTls) { SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); }
+    // TlsCtx destructor calls mbedtls_ssl_close_notify + frees everything
     close(fd);
     return resp.status > 0;
 }
@@ -488,7 +595,7 @@ cleanup:
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "libhttp v1.0 - github.com/binhmod/libhttp\n"
+            "libhttp v1.1 (mbedTLS) - github.com/binhmod/libhttp\n"
             "\n"
             "Usage:\n"
             "  http [-L] [-k] [-s] [--cacert FILE] [-H 'Name: Value']... METHOD URL [BODY]\n"

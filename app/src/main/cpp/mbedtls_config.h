@@ -1,6 +1,6 @@
 /**
  * mbedtls_config.h
- * Minimal TLS 1.2/1.3 client configuration
+ * TLS 1.2/1.3 client, X.509, CTR-DRBG, AES-GCM, ECDHE, SHA-2
  */
 #pragma once
 

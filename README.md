@@ -91,7 +91,7 @@ echo 'body' | http PUT https://example.com
 http POST https://example.com @payload.json
 
 # Custom CA bundle
-http -cacert /etc/ssl/my-ca.pem GET https://internal.example.com
+http --cacert /etc/ssl/my-ca.pem GET https://internal.example.com
 ```
 
 ## Output
